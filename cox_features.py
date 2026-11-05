@@ -51,6 +51,7 @@ Standard library only.
 """
 import argparse
 import csv
+import difflib
 import fnmatch
 import math
 import re
@@ -339,6 +340,47 @@ def run_model(rows, time_col, event_col, limit, feature_terms, cov_terms, strata
 STAGE_COLUMN = ["stage"]
 
 
+
+COLUMN_ALIASES = {
+    "age": ["age", "age_at_diagnosis", "age_at_index", "diagnosis_age", "age_years",
+            "age_at_initial_pathologic_diagnosis"],
+    "stage": ["stage", "ajcc_pathologic_stage", "pathologic_stage", "tumor_stage",
+              "ajcc_pathologic_tumor_stage", "neoplasm_disease_stage_american_joint_committee_on_cancer_code"],
+    "os_months": ["os_months", "overall_survival_months"],
+    "os_status": ["os_status", "overall_survival_status"],
+}
+
+
+def norm_name(name):
+    """Column name for matching: lower case, only letters and digits."""
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def resolve_column(col, header, source):
+    """Actual column name for `col`: exact, then ignoring case / spaces / _ / (),
+    then known aliases (age -> AGE, Diagnosis Age, age_at_diagnosis, ...)."""
+    if col in header:
+        return col
+    by_norm = {}
+    for c in header:
+        by_norm.setdefault(norm_name(c), c)
+    if norm_name(col) in by_norm:
+        found = by_norm[norm_name(col)]
+        print(f"Using column {found!r} for {col!r}")
+        return found
+    for names in COLUMN_ALIASES.values():
+        if norm_name(col) in {norm_name(n) for n in names}:
+            for n in names:
+                if norm_name(n) in by_norm:
+                    found = by_norm[norm_name(n)]
+                    print(f"Using column {found!r} for {col!r}")
+                    return found
+    close = difflib.get_close_matches(norm_name(col), list(by_norm), n=5, cutoff=0.5)
+    close += [c for c in by_norm if norm_name(col) in c and c not in close][:5]
+    hint = (" Similar columns: " + ", ".join(repr(by_norm[c]) for c in close[:8])) if close else ""
+    sys.exit(f"{source}: no column {col!r}.{hint}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -358,7 +400,6 @@ def main():
     parser.add_argument("--multivariable", action="store_true", help="Also fit all features in one model")
     parser.add_argument("--no-all", action="store_true", help="With --by, skip the All cohort")
     args = parser.parse_args()
-    STAGE_COLUMN[0] = args.stage_column
 
     with open(args.input, newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
@@ -366,9 +407,22 @@ def main():
         rows = [{k.strip(): (v or "").strip() for k, v in r.items() if k is not None} for r in reader]
     if not rows:
         sys.exit(f"{args.input}: no data rows")
-    for col in [args.time, args.event] + args.adjust + [c for c in (args.strata, args.by) if c]:
-        if col not in header:
-            sys.exit(f"{args.input}: no column {col!r}")
+    def find(col):
+        return resolve_column(col, header, args.input)
+    args.time, args.event = find(args.time), find(args.event)
+    stage_wanted = args.stage_column
+    args.adjust = [find(c) for c in args.adjust]
+    args.strata = find(args.strata) if args.strata else None
+    args.by = find(args.by) if args.by else None
+    # the stage column given to --adjust / --strata / --by is the one parsed as stage
+    used = args.adjust + [c for c in (args.strata, args.by) if c]
+    if args.stage_column not in header:
+        same = [c for c in used if norm_name(c) == norm_name(stage_wanted)]
+        if same:
+            args.stage_column = same[0]
+        elif any(norm_name(c) == norm_name(stage_wanted) for c in header):
+            args.stage_column = next(c for c in header if norm_name(c) == norm_name(stage_wanted))
+    STAGE_COLUMN[0] = args.stage_column
     key = [c for c in ("group", "subject_id") if c in header]
     dupes = [k for k, n in Counter(tuple(r[c] for c in key) for r in rows).items() if n > 1]
     if dupes:
